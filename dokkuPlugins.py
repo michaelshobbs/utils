@@ -47,7 +47,8 @@ class dokkuPlugins(object):
                         <a href="https://github.com/jezdez/dokku-postgres-plugin">PostgreSQL</a> \
                         <a href="https://github.com/jlachowski/dokku-pg-plugin">PostgreSQL</a> \
                         <a href="https://github.com/Kloadut/dokku-pg-plugin">PostgreSQL</a> \
-                        <a href="https://github.com/ohardy/dokku-mariadb">MariaDB</a>"""
+                        <a href="https://github.com/ohardy/dokku-mariadb">MariaDB</a> \
+                        <a href="https://github.com/cef/dokku-hipchat">HipChat Notifications</a>"""
         else:
             _, response = cls.http.request('http://progrium.viewdocs.io/dokku/plugins')
 
@@ -56,35 +57,45 @@ class dokkuPlugins(object):
                 plugin_url = link['href']
                 plugin_name = '%s' % (plugin_url.split('/')[4])
                 plugin_owner = '%s' % (plugin_url.split('/')[3])
-                plugin_owner_url = '%s/%s/%s/%s' % (plugin_url.split('/')[0], plugin_url.split('/')[1], plugin_url.split('/')[2], plugin_owner)
-                plugin_repo_metadata = cls._gh_repo_metadata(plugin_owner, plugin_name, plugin_url)
+                plugin_repo_metadata, plugin_owner, plugin_name, plugin_url = cls._gh_repo_metadata(plugin_owner, plugin_name, plugin_url)
+                plugin_owner_url = "https://github.com/%s" % plugin_owner
 
-                if plugin_repo_metadata['owner']['type'] == 'Organization':
-                    organization_members_metadata = cls._gh_org_members(plugin_repo_metadata['owner']['login'])
-                    pluginAuthors = [member['login'] for member in organization_members_metadata if member['type'] == 'User']
-                else:
-                    pluginAuthors = [plugin_url.split('/')[3]]
-
+                plugin_authors = cls._plugin_authors(plugin_repo_metadata, plugin_url, plugin_name)
                 repo_plugin_types = cls._plugin_types(plugin_owner, plugin_name, plugin_url)
 
                 if plugin_url not in [url for url in [plugin['url'] for plugin in cls.plugins]]:
-                    cls.plugins.append({'name': plugin_name, 'authors': pluginAuthors, 'ownerUrl': plugin_owner_url, 'url': plugin_url, 'types': repo_plugin_types})
+                    cls.plugins.append({'name': plugin_name, 'authors': ', '.join(plugin_authors), 'ownerUrl': plugin_owner_url, 'url': plugin_url, 'types': ', '.join(repo_plugin_types)})
 
     @classmethod
     def _plugin_types(cls, owner, repo_name, repo_url):
         try:
-            repo_contents = cls._gh_repo_contents(owner, repo_name, repo_url)
+            repo_contents, _, _ = cls._gh_repo_contents(owner, repo_name, repo_url)
         except ApiNotFoundError, e:
             raise e
 
         repo_files = [item['path'] for item in repo_contents if item['type'] == 'file']
-        repo_plugin_types = [repo_file for repo_file in repo_files if repo_file in cls.known_plugin_types]
+        repo_plugin_types = [repo_file.encode('ascii', 'ignore') for repo_file in repo_files if repo_file in cls.known_plugin_types]
         return repo_plugin_types
 
     @classmethod
+    def _plugin_authors(cls, repo_metadata, repo_url, repo_name):
+        if repo_metadata['owner']['type'] == 'Organization':
+            organization_members_metadata = cls._gh_org_members(repo_metadata['owner']['login'])
+            if organization_members_metadata:
+                authors = ['@%s' % member['login'].encode('ascii', 'ignore') for member in organization_members_metadata if member['type'] == 'User']
+            else:
+                # print "no members found for repo %s. digging deeper" % (repo_url)
+                default_branch_ref = cls.gh.repos(repo_metadata['owner']['login'])(repo_name).git.refs.heads(repo_metadata['default_branch']).get()['object']['sha']
+                latest_committer = cls.gh.repos(repo_metadata['owner']['login'])(repo_name).commits(default_branch_ref).get()['author']['login']
+                authors = ["@%s" % latest_committer]
+        else:
+            authors = ['@%s' % repo_url.split('/')[3]]
+
+        return authors
+
+    @classmethod
     def _gh_org_members(cls, owner):
-        org_metadata = cls.gh.orgs(owner).members.get()
-        return org_metadata
+        return cls.gh.orgs(owner).members.get()
 
     @classmethod
     def _gh_repo_metadata(cls, owner, repo_name, repo_url):
@@ -99,8 +110,9 @@ class dokkuPlugins(object):
             except ApiNotFoundError, e:
                 print "failed contents: %s, %s. %s" % (repo_url, repo_name, e)
                 raise e
-
-        return repo_metadata
+            repo_url = "https://github.com/%s/%s" % (owner, repo_name)
+        # return all this because github will redirect www but not api
+        return repo_metadata, owner, repo_name, repo_url
 
     @classmethod
     def _gh_repo_contents(cls, owner, repo_name, repo_url):
@@ -115,8 +127,8 @@ class dokkuPlugins(object):
             except ApiNotFoundError, e:
                 print "failed contents: %s, %s. %s" % (repo_url, repo_name, e)
                 raise e
-
-        return repo_contents
+        # return all this because github will redirect www but not api
+        return repo_contents, owner, repo_name
 
     @classmethod
     def findPluginAuthor(cls, plugin_name):
@@ -131,10 +143,8 @@ class dokkuPlugins(object):
     def findPluginTypeAuthors(cls, plugin_types):
         plugins = []
         for plugin in cls.plugins:
-            # print "checking for %s in %s" % (plugin_types, plugin['types'])
             for plugin_type in plugin_types:
-                if plugin_type in plugin['types']:
-                    # print "%s in %s (%s)" % (plugin_types, plugin['name'], ' '.join(plugin['types']))
+                if plugin_type in plugin['types'] and plugin['url'] not in [url for url in [p['url'] for p in plugins]]:
                     plugins.append(plugin)
         return plugins
 
@@ -146,26 +156,32 @@ def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', help='used to find plugin details by name')
     parser.add_argument('--types', help='used to find plugin details by type')
+    parser.add_argument('--columns', help='used to find plugin details by type')
     parser.add_argument('--short', help='short output', action='store_true')
     parser.add_argument('--testing', help='use testing response', action='store_true')
     args = parser.parse_args()
 
     dp = dokkuPlugins(testing=args.testing)
-    short_headers = ['url', 'authors']
+    if args.columns:
+        tab_headers = args.columns.split(',')
+    elif args.short:
+        tab_headers = ['url', 'authors']
+    elif args.short and args.types:
+        tab_headers = ['url', 'types', 'authors']
+    else:
+        tab_headers = None
 
     if args.name:
         plugins = dp.findPluginAuthor(plugin_name=args.name)
     elif args.types:
         plugins = dp.findPluginTypeAuthors(plugin_types=args.types.split(','))
-        short_headers = ['url', 'types', 'authors']
     else:
         plugins = dp.listPlugins()
 
     if plugins:
-        if args.short:
-            # table = [(plugin[short_headers[0]], plugin[short_headers[1]]) for plugin in plugins]
-            table = [[plugin[header] for header in short_headers] for plugin in plugins]
-            print tabulate(table, short_headers, tablefmt='simple')
+        if tab_headers:
+            table = [[plugin[header] for header in tab_headers] for plugin in plugins]
+            print tabulate(table, tab_headers, tablefmt='simple')
         else:
             print tabulate(plugins, headers='keys', tablefmt='simple')
         return 0
